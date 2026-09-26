@@ -1,0 +1,73 @@
+# 🌸 Sakura Log
+
+A tiny, single-user time & work logger — like Clockify, minus everything you don't need.
+Pastel anime theme, a mascot who cheers you on, and a full **Hijri Shamsi (شمسی)** calendar.
+
+- **Timer**: one click start/stop, edit the running entry on the fly, "continue" any past entry
+- **Projects → sub tasks**: colors, check tasks off, archive old projects, per-project/task totals
+- **Manual entries**: add/edit/delete, with a Shamsi or Gregorian date picker (entries past midnight handled)
+- **Calendar**: month view in Shamsi (RTL, Saturday-first, Persian digits) or Gregorian, both dates on every day
+- **Reports**: today / week / month / year / custom range, stacked hours chart, breakdown by project & task, CSV export
+- **Settings**: day/night theme, custom wallpaper, daily goal, week start, password change, JSON backup
+
+No dependencies: Python 3.9+ standard library and a single SQLite file.
+
+## Run locally
+
+```bash
+python3 server.py            # asks you to create a password on the first run
+# open http://127.0.0.1:8765
+```
+
+## Deploy on a VPS
+
+```bash
+# 1. copy the files
+sudo useradd --system --home /opt/sakura-log sakura
+sudo mkdir -p /opt/sakura-log && sudo cp -r server.py static /opt/sakura-log/
+sudo mkdir -p /opt/sakura-log/data && sudo chown -R sakura: /opt/sakura-log
+
+# 2. set your password (stored as a salted PBKDF2 hash in the DB)
+sudo -u sakura python3 /opt/sakura-log/server.py --set-password
+
+# 3. run it as a service
+sudo cp deploy/sakura-log.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now sakura-log
+```
+
+The server only listens on `127.0.0.1`, so put HTTPS in front of it. Easiest is
+[Caddy](https://caddyserver.com): point a domain at the VPS, edit `deploy/Caddyfile`, and
+`sudo cp deploy/Caddyfile /etc/caddy/Caddyfile && sudo systemctl reload caddy`.
+
+**No domain?** Use an SSH tunnel instead and set `LOGGER_SECURE_COOKIE=0` in the service file:
+
+```bash
+ssh -L 8765:127.0.0.1:8765 you@your-vps     # then open http://127.0.0.1:8765
+```
+
+### Configuration (environment variables)
+
+| Variable | Default | |
+|---|---|---|
+| `LOGGER_HOST` | `127.0.0.1` | bind address |
+| `LOGGER_PORT` | `8765` | port |
+| `LOGGER_DB` | `./data/logger.db` | database file |
+| `LOGGER_PASSWORD` | – | initial password if none is set (handy for Docker-style setups) |
+| `LOGGER_SECURE_COOKIE` | `0` | set `1` when served over HTTPS |
+| `LOGGER_ACCESS_LOG` | `0` | set `1` to log every request |
+
+## Wallpapers
+
+Put your favourite anime art in `static/wallpapers/` and set the wallpaper in **Settings** to
+`wallpapers/your-file.jpg` (or paste any image URL). The UI stays readable thanks to frosted-glass cards.
+
+## Backups
+
+Everything is in `data/logger.db`. Copy it (`sqlite3 data/logger.db ".backup backup.db"`), or use
+**Settings → Download backup** for a JSON dump.
+
+## Security notes
+
+- Single password, 30-day `HttpOnly` + `SameSite=Strict` session cookie; changing the password logs out other sessions.
+- Login is throttled (10 failures per 15 minutes).
+- The API only accepts JSON bodies, which blocks cross-site form posts.

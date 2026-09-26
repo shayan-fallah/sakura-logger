@@ -1,0 +1,21 @@
+[Unit]
+Description=Sakura Log time tracker
+After=network.target
+
+[Service]
+Type=simple
+User=sakura
+WorkingDirectory=/opt/sakura-log
+ExecStart=/usr/bin/python3 /opt/sakura-log/server.py
+Environment=LOGGER_HOST=127.0.0.1
+Environment=LOGGER_PORT=8765
+# Set to 1 once it's served over HTTPS (Caddy below does that for you).
+Environment=LOGGER_SECURE_COOKIE=1
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/sakura-log/data
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

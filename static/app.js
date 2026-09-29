@@ -422,6 +422,9 @@ $('#login-form').addEventListener('submit', async (e) => {
 async function showMain() {
   S.prefs = { ...DEFAULT_PREFS, ...(await api('GET', '/api/prefs')) };
   applyPrefs();
+  // The server renders Obsidian notes, so it needs to know which day an entry falls on for you.
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  if (tz && S.prefs.tz !== tz) safe(savePrefs)({ tz });
   await Promise.all([loadProjects(), loadTimer()]);
   $('#login').hidden = true;
   $('#main').hidden = false;
@@ -1233,6 +1236,7 @@ VIEWS.settings = async function () {
         <button class="btn primary">Change password</button>
       </form>
     </section>
+    <section class="card" id="obsidian" style="grid-column:1/-1"></section>
     <section class="card">
       <h2><span class="deco">📦</span> Data</h2>
       <p class="muted small" style="margin-top:0">Everything lives in one SQLite file on your server (<code>data/logger.db</code>). Grab a JSON backup any time:</p>
@@ -1269,7 +1273,103 @@ VIEWS.settings = async function () {
     download(`sakura-log-backup_${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}.json`, JSON.stringify(data, null, 2), 'application/json');
   });
   $('#logout').onclick = safe(async () => { await api('POST', '/api/logout'); showLogin(); });
+  await renderObsidian();
 };
+
+function obsidianStatus(o, extra = '') {
+  const st = o.status || {};
+  const parts = [];
+  if (!o.enabled) parts.push('Sync is off.');
+  if (st.last_sync) parts.push(`Last sync ${new Date(st.last_sync * 1000).toLocaleString('en-GB')}`);
+  if (st.last_note) parts.push(`last note: <code>${esc(st.last_note)}</code>`);
+  if (st.last_error) parts.push(`<b style="color:var(--danger)">⚠ ${esc(st.last_error)}</b>`);
+  return (extra ? extra + '<br>' : '') + (parts.join(' · ') || 'Not synced yet.');
+}
+
+async function renderObsidian() {
+  const box = $('#obsidian');
+  if (!box) return;
+  const o = await api('GET', '/api/obsidian');
+  box.innerHTML = `
+    <div class="card-head"><h2><span class="deco">🔮</span> Obsidian sync</h2>
+      <div class="seg" id="obs-on"><button type="button" data-v="true" class="${o.enabled ? 'active' : ''}">On</button><button type="button" data-v="false" class="${o.enabled ? '' : 'active'}">Off</button></div></div>
+    <p class="muted small" style="margin-top:0">Writes one note per month into your vault through the CouchDB database of the
+      <b>Self-hosted LiveSync</b> plugin (unencrypted vaults only). Notes update a few seconds after you log time.</p>
+    <form id="obs-form">
+      <div class="row">
+        <label class="field">CouchDB URL<input class="input" name="url" required value="${esc(o.url)}" placeholder="http://127.0.0.1:5984"></label>
+        <label class="field">Database<input class="input" name="database" required value="${esc(o.database)}"></label>
+      </div>
+      <div class="row">
+        <label class="field">Username<input class="input" name="username" required value="${esc(o.username)}" autocomplete="off"></label>
+        <label class="field">Password<input class="input" type="password" name="password" autocomplete="new-password" placeholder="${o.has_password ? '•••••• saved — leave empty to keep' : ''}"></label>
+      </div>
+      <div class="row">
+        <label class="field">Folder in vault<input class="input" name="folder" value="${esc(o.folder)}" placeholder="Time Log"></label>
+        <label class="field">Project names as [[links]]<div class="row">
+          <div class="seg" id="obs-links"><button type="button" data-v="true" class="${o.link_projects ? 'active' : ''}">Yes</button><button type="button" data-v="false" class="${o.link_projects ? '' : 'active'}">No</button></div></div></label>
+      </div>
+      <div class="row" style="justify-content:flex-start">
+        <button class="btn primary" style="flex:0 0 auto">Save</button>
+        <button type="button" class="btn" id="obs-test" style="flex:0 0 auto">Test connection</button>
+        <button type="button" class="btn lav" id="obs-sync" style="flex:0 0 auto">⟳ Sync all now</button>
+      </div>
+    </form>
+    <p class="small muted" id="obs-status" style="margin-bottom:0">${obsidianStatus(o)}</p>`;
+
+  const form = $('#obs-form');
+  const fields = () => ({
+    url: form.elements.url.value.trim(), database: form.elements.database.value.trim(),
+    username: form.elements.username.value.trim(), password: form.elements.password.value,
+    folder: form.elements.folder.value.trim(),
+  });
+  const put = (data) => api('PUT', '/api/obsidian', data);
+  $('#obs-on').onclick = safe(async (e) => {
+    const b = e.target.closest('[data-v]');
+    if (!b) return;
+    const on = b.dataset.v === 'true';
+    // Turning it on saves whatever is typed in the form, so it can't enable with stale settings.
+    await put(on ? { ...fields(), enabled: true } : { enabled: false });
+    toast(on ? 'Obsidian sync on ✿' : 'Obsidian sync off');
+    renderObsidian();
+  });
+  $('#obs-links').onclick = safe(async (e) => {
+    const b = e.target.closest('[data-v]');
+    if (!b) return;
+    await put({ link_projects: b.dataset.v === 'true' });
+    renderObsidian();
+  });
+  form.addEventListener('submit', safe(async (e) => {
+    e.preventDefault();
+    await put(fields());
+    toast('Saved ✿');
+    renderObsidian();
+  }));
+  $('#obs-test').onclick = safe(async () => {
+    await put(fields());
+    const st = $('#obs-status');
+    st.innerHTML = 'Testing… ✧';
+    try {
+      const r = await api('POST', '/api/obsidian/test');
+      st.innerHTML = `<b style="color:var(--pink)">✓ ${esc(r.message)}</b>`;
+    } catch (err) {
+      st.innerHTML = `<b style="color:var(--danger)">✗ ${esc(err.message)}</b>`;
+    }
+  });
+  $('#obs-sync').onclick = safe(async () => {
+    const st = $('#obs-status');
+    st.innerHTML = 'Syncing… ✧';
+    try {
+      const r = await api('POST', '/api/obsidian/sync');
+      const fresh = await api('GET', '/api/obsidian');
+      st.innerHTML = obsidianStatus(fresh, fresh.enabled
+        ? `<b style="color:var(--pink)">✓ Wrote ${r.written} note${r.written === 1 ? '' : 's'}</b>`
+        : '<b>Turn sync on first.</b>');
+    } catch (err) {
+      st.innerHTML = `<b style="color:var(--danger)">✗ ${esc(err.message)}</b>`;
+    }
+  });
+}
 
 // ------------------------------------------------------------------ ticking
 

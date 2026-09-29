@@ -32,6 +32,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from obsidian import LiveSyncClient, ObsidianSync, SyncError
+
 BASE = Path(__file__).resolve().parent
 STATIC = BASE / "static"
 DB_PATH = Path(os.environ.get("LOGGER_DB", BASE / "data" / "logger.db"))
@@ -39,6 +41,7 @@ HOST = os.environ.get("LOGGER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("LOGGER_PORT", "8765"))
 SECURE_COOKIE = os.environ.get("LOGGER_SECURE_COOKIE", "0") == "1"
 SESSION_SECONDS = 30 * 24 * 3600
+SYNC = None  # ObsidianSync, created in main()
 MAX_BODY = 256 * 1024
 COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
@@ -174,6 +177,15 @@ def get_or_404(conn, table, id_):
     return row
 
 
+def touched(req, *timestamps):
+    """Queue the Obsidian notes covering these entry start times for a rewrite (after commit)."""
+    req.after_commit.append(lambda: SYNC and SYNC.mark(*timestamps))
+
+
+def touched_all(req):
+    req.after_commit.append(lambda: SYNC and SYNC.mark_all())
+
+
 # ---------------------------------------------------------------- auth
 
 _login_fail = {"count": 0, "since": 0.0}
@@ -236,6 +248,9 @@ def get_prefs(req, conn, body, q):
 
 @route("PUT", "/api/prefs")
 def put_prefs(req, conn, body, q):
+    old = json.loads(kv_get(conn, "prefs", "{}"))
+    if (old.get("calendar"), old.get("tz")) != (body.get("calendar"), body.get("tz")):
+        touched_all(req)
     kv_set(conn, "prefs", json.dumps(body))
     return body
 
@@ -299,12 +314,15 @@ def update_project(req, conn, pid, body, q):
         "UPDATE projects SET name=?, color=?, archived=? WHERE id=?",
         (p["name"], p["color"], p["archived"], p["id"]),
     )
+    if "name" in body:
+        touched_all(req)
     return p
 
 
 @route("DELETE", r"/api/projects/(\d+)")
 def delete_project(req, conn, pid, body, q):
     get_or_404(conn, "projects", pid)
+    touched(req, *[r[0] for r in conn.execute("SELECT start_ts FROM entries WHERE project_id=?", (int(pid),))])
     conn.execute("DELETE FROM projects WHERE id=?", (int(pid),))
 
 
@@ -331,12 +349,15 @@ def update_task(req, conn, tid, body, q):
     if "done" in body:
         t["done"] = 1 if body["done"] else 0
     conn.execute("UPDATE tasks SET name=?, done=? WHERE id=?", (t["name"], t["done"], t["id"]))
+    if "name" in body:
+        touched_all(req)
     return t
 
 
 @route("DELETE", r"/api/tasks/(\d+)")
 def delete_task(req, conn, tid, body, q):
     get_or_404(conn, "tasks", tid)
+    touched(req, *[r[0] for r in conn.execute("SELECT start_ts FROM entries WHERE task_id=?", (int(tid),))])
     conn.execute("DELETE FROM tasks WHERE id=?", (int(tid),))
 
 
@@ -381,12 +402,14 @@ def create_entry(req, conn, body, q):
         "INSERT INTO entries(project_id,task_id,description,start_ts,end_ts) VALUES(?,?,?,?,?)",
         (pid, tid, desc, start, end),
     )
+    touched(req, start)
     return dict(get_or_404(conn, "entries", cur.lastrowid))
 
 
 @route("PATCH", r"/api/entries/(\d+)")
 def update_entry(req, conn, eid, body, q):
     e = dict(get_or_404(conn, "entries", eid))
+    old_start = e["start_ts"]
     if "description" in body:
         e["description"] = s(body, "description", 500, required=False) or ""
     if "project_id" in body or "task_id" in body:
@@ -410,12 +433,13 @@ def update_entry(req, conn, eid, body, q):
         "UPDATE entries SET project_id=?, task_id=?, description=?, start_ts=?, end_ts=? WHERE id=?",
         (e["project_id"], e["task_id"], e["description"], e["start_ts"], e["end_ts"], e["id"]),
     )
+    touched(req, old_start, e["start_ts"])
     return e
 
 
 @route("DELETE", r"/api/entries/(\d+)")
 def delete_entry(req, conn, eid, body, q):
-    get_or_404(conn, "entries", eid)
+    touched(req, get_or_404(conn, "entries", eid)["start_ts"])
     conn.execute("DELETE FROM entries WHERE id=?", (int(eid),))
 
 
@@ -438,7 +462,9 @@ def start_timer(req, conn, body, q):
     )
     desc = s(body, "description", 500, required=False) or ""
     t = now()
+    prev = running(conn)
     conn.execute("UPDATE entries SET end_ts=MAX(?, start_ts+1) WHERE end_ts IS NULL", (t,))
+    touched(req, t, prev and prev["start_ts"])
     cur = conn.execute(
         "INSERT INTO entries(project_id,task_id,description,start_ts,end_ts) VALUES(?,?,?,?,NULL)",
         (pid, tid, desc, t),
@@ -452,7 +478,61 @@ def stop_timer(req, conn, body, q):
     if not r:
         return {"stopped": None}
     conn.execute("UPDATE entries SET end_ts=MAX(?, start_ts+1) WHERE id=?", (now(), r["id"]))
+    touched(req, r["start_ts"])
     return {"stopped": dict(get_or_404(conn, "entries", r["id"]))}
+
+
+# ---------------------------------------------------------------- obsidian
+
+def obsidian_view(conn):
+    cfg = ObsidianSync.load_config(conn)
+    cfg["has_password"] = bool(cfg.pop("password"))
+    cfg["status"] = SYNC.status if SYNC else {}
+    return cfg
+
+
+@route("GET", "/api/obsidian")
+def get_obsidian(req, conn, body, q):
+    return obsidian_view(conn)
+
+
+@route("PUT", "/api/obsidian")
+def put_obsidian(req, conn, body, q):
+    cfg = ObsidianSync.load_config(conn)
+    for key in ("url", "database", "username", "folder"):
+        if key in body:
+            cfg[key] = s(body, key, 300, required=key != "folder") or ""
+    if not re.match(r"^https?://", cfg["url"]):
+        raise ApiError(400, "CouchDB URL must start with http:// or https://")
+    if ".." in cfg["folder"].split("/"):
+        raise ApiError(400, "Folder can't contain '..'")
+    if body.get("password"):  # empty means "keep the saved one"
+        cfg["password"] = s(body, "password", 300)
+    for key in ("enabled", "link_projects"):
+        if key in body:
+            cfg[key] = bool(body[key])
+    ObsidianSync.save_config(conn, cfg)
+    if cfg["enabled"]:
+        touched_all(req)
+    return obsidian_view(conn)
+
+
+@route("POST", "/api/obsidian/test")
+def test_obsidian(req, conn, body, q):
+    try:
+        return LiveSyncClient(ObsidianSync.load_config(conn)).check()
+    except SyncError as e:
+        raise ApiError(400, str(e))
+
+
+@route("POST", "/api/obsidian/sync")
+def sync_obsidian(req, conn, body, q):
+    try:
+        written = SYNC.sync(everything=True, force=True)
+    except SyncError as e:
+        SYNC.status["last_error"] = str(e)
+        raise ApiError(400, str(e))
+    return {"written": written, "status": SYNC.status}
 
 
 # ---------------------------------------------------------------- backup
@@ -586,8 +666,11 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(401, "Login required")
                 body = self.read_json() if method in ("POST", "PATCH", "PUT") else {}
                 query = {k: v[0] for k, v in parse_qs(url.query).items()}
+                self.after_commit = []
                 result = fn(self, conn, *match.groups(), body=body, q=query)
                 conn.commit()
+                for hook in self.after_commit:
+                    hook()
                 return self.send_json({"ok": True} if result is None else result)
             except ApiError as e:
                 conn.rollback()
@@ -642,6 +725,9 @@ def main():
     finally:
         conn.close()
 
+    global SYNC
+    SYNC = ObsidianSync(db)
+    SYNC.mark_all()  # catch up on anything changed while we were down
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
     print(f"✿ Sakura Log running on http://{HOST}:{PORT}")
